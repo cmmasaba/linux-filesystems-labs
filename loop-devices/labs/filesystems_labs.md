@@ -61,3 +61,29 @@ Comparison of thin provisioning to the traditional approach of thick provisionin
 | Allocation             | Space is allocated upfront and locked down.                                                                    | Space is allocated on demand as data is written and drawn from the shared storage pool.  |
 | Utilization efficiency | Low utilization efficiency resulting in dead space since application rarely use up all the space they reserve. | High utilization efficiency since programs only use the space they require.              |
 | Overprovisioning Risk  | Zero risk since the space the program reserved is always available.                                            | High risk if most application write data simultaneously and exceed the shared pool size. |
+
+## 3. Partitioning
+
+![](/loop-devices/labs/assets/03-partitioning/partitioning.png)
+
+Partitioning is the process of subdividing a large disk into smaller blocks. Just like any other block device, loop devices can also be partitioned. In this experiment I create a 1GB image and attach it to /dev/loop0. Using the `parted`(partition editor) tool I create a GPT style partition table on the disk. There are generally 2 types of partition tables, the traditional Master Boot Record (MBR) and the newer Globally Unique Identifier Partition Table (GPT). GPT keeps two partition tables, the primary GPT header stored at the very start of the disk and the secondary backup GPT header table stored at the end of the disk.<br>
+I make 2 ext4 primary partitions on the disk then unmount the loop device and attach it again with -P option to reload the partition table. `lsblk` now shows two partitions under the loop device. The rest of the steps involve making ext4 filesystems on the partitions, mounting them and showing writes can be done on both partitions.
+![](/loop-devices/labs/assets/03-partitioning/inspect_disk.png)
+The GPT partition tables created can be viewed using the command `fdisk -l /dev/loop0`. THe output shows the partition style, the GUID and the partitions.
+
+## 4. Resizing a loop device and its filesystem
+
+![](/loop-devices/labs/assets/04-resizing/resizing_dev_and_fs.png)
+Since loop devices are backed by files, resizing the block device by expanding or shrinking the file is easy. Expanding the file and loop device size is can be done while the filesystem is mounted. First I increase the size using truncate, at this point even though the backing file size is increased, the loop device and filesystem still report the old size. I force the loop driver to reread the device's capacity using the `-c` option and the filesystem to reread the new changes using `resizefs`.
+
+![](/loop-devices/labs/assets/04-resizing/shrink_disk_and_fs.png)
+Shrinking the size of the loop device and filesystem is abit trickier. For this the fileystem must first be unmounted and the steps followed in a specific order. First I shrink the size of the file down then force the loop driver to reread the new device size. Next I run `e2fsck` which checks the filesystem status, running it with `-f` option forces checking even if the filesystem may be corrupted. Since the original image already had a filesystem before it was shrunk, e2fsck rightly reports the filesystem may be corrupted. We proceed despite the warning and all the 5 checks pass. Next we force the filesystem to record the new size. We can then mount and use the device again.
+
+## 5. Read-only mode
+
+![](/loop-devices/labs/assets/05-read_only_mode/read_only_mounts.png)
+Read-only mode does not allow writing. It can be configured at two levels, when mounting the filesystem inside the loop device or when attaching the loop device to the file. I attach the loop device in read-only mode using the `--read-only` option of losetup. Then I mount the ext4 filesystem in read-noly mode using `ro,noload`; ro means read-only and noload means the ext4 journal should not be replayed on the filesystem, replaying the journal would have attempted writing on the filesytem as it is mounted. After this `blockdev --getro` reports the filesystem is read-only and any attempt to write to it fails with an error.<br>
+I experiment with a loop device that allows read/write and a filesystem that supports read-only, the filesystem setting is respected and it blocks any writes. Another experiment is with a filesystem that supports read/write but a loop device that supports read-only and the loop device configuration is respected, blocking any writes.
+
+## 6. Filesystem corruption and repair
+
