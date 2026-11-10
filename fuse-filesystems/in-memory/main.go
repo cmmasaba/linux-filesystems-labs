@@ -32,6 +32,7 @@ func newNode(deviceID uint64, inode uint64, mode uint32, userID uint32, groupID 
 			Dev:      deviceID,
 			Ino:      inode,
 			Mode:     mode,
+			Nlink:    1,
 			Uid:      userID,
 			Gid:      groupID,
 			Atim:     tmstmp,
@@ -233,7 +234,9 @@ func (fs *FileSystem) Rename(oldpath, newpath string) int {
 		return -fuse.ENOENT
 	}
 
-	newParent, newName, newNode := fs.lookupNode(newpath, nil)
+	// Passing oldNode as the ancestor makes lookupNode return an empty name
+	// when newpath runs through oldNode, i.e. a directory moved into itself.
+	newParent, newName, newNode := fs.lookupNode(newpath, oldNode)
 
 	if newParent == nil {
 		return -fuse.ENOENT
@@ -436,11 +439,16 @@ func resize(slice []byte, size int64, zeroinit bool) []byte {
 
 		copy(newSlice, slice)
 		slice = newSlice
-	} else if zeroinit {
+	} else {
+		// Reassign (not shadow) the outer slice so its length always matches size.
+		// Otherwise a shrink keeps the old length and a later grow skips zeroing
+		// the bytes between the new and old lengths, exposing stale data.
 		i := len(slice)
-		slice := slice[:size]
-		for ; len(slice) > i; i++ {
-			slice[i] = 0
+		slice = slice[:size]
+		if zeroinit {
+			for ; len(slice) > i; i++ {
+				slice[i] = 0
+			}
 		}
 	}
 
@@ -496,6 +504,11 @@ func (fs *FileSystem) Mknod(path string, mode uint32, deviceID uint64) int {
 }
 
 func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintf(os.Stderr, "usage: %s MOUNTPOINT [fuse options...]\n", os.Args[0])
+		os.Exit(2)
+	}
+
 	fs := NewFileSystem()
 	host := fuse.NewFileSystemHost(fs)
 	host.SetCapReaddirPlus(true)
