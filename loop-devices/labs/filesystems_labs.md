@@ -12,6 +12,7 @@ which losetup lsblk mkfs.ext4 mount umount truncate dd blockdev
 ```
 
 If you're curious to understand what the tools do you can check their man pages. Then I list the available block devices using `lsblk`, only `/dev/nvme0n1` is available. I try inspecting the status information of all loop devices being used by `losetup -a` but it returns empty if there are none under active use. Using `losetup --find` shows the first unused loop device which is /dev/loop0.
+
 ![](/loop-devices/labs/assets/prerequisites.png)
 
 ## 1. Creating and Mounting a Loop Device
@@ -22,17 +23,21 @@ I create the backing file using `truncate` specifying a size of 100MiB and the d
 I attach the next available loop device to the file created using the command `losetup --find --show disk.img`, it is attached to device /dev/loop0. `lsblk` shows the device type is loop and it is not yet mounted. `losetup -l /dev/loop0` shows additional info about the loop device for example the location of the backing file, the logical sector size, whether it is read only. I also use `blockdev` to inspect the total size of the loop device, the physical block size and the logical sector size. Finally, using `ls -l /dev/loop0` shows the device is identified as a block device.
 
 ![](/loop-devices/labs/assets/01-create_and_mount/create_filesystem_loopdevice.png)
+
 Next I create a ext4 filesystem on the loop device using. `sudo blkid /dev/loop0` shows the filesystem UUID and the type of filesystem. `sudo dumpe2fs -h /dev/loop0` shows ext4 filesystem information.
 
 ![](/loop-devices/labs/assets/01-create_and_mount/mount_use_unmount.png)
+
 I mount the loop device under the `mnt` folder. `df -h mnt` shows the filesystem storage usage information. We see that the reported size is 90M instead of 100 and the available size is 83M, the filesystem uses part of the storage to store filesystem metadata which is why the reported sizes are smaller than would be expected. I write test data to the mounted filesystem and confirm it is saved before unmounting the filesystem and detaching the loop device.
 
 ![](/loop-devices/labs/assets/01-create_and_mount/remount_device.png)
+
 This last section shows that attaching a loop device to the same image and remounting the filesystem, the data created before is still available and readable.
 
 ## 2. Sparse Files
 
 ![](/loop-devices/labs/assets/02-sparse_files/sparse_vs_allocated_files.png)
+
 I create two types of files above both with size 500MiB, one using `truncate` and the other using `dd`. When I compare the two file sizes using `ls -lh` they both report size 500MiB. However when I use `du -h`, the file created using truncate reports disk usage is 0 while the other created using dd reports disk usage is 500MiB. The file created using truncate is a `sparse file` while the other one is an `allocated file`. Using stat on the two files reports the allocated file has data blocks while the sparse file has no data blocks. I also check the extent and fragmentation information of the two files using `filefrag`, the allocated file has 1 extent while the sparse file has none. Thus far we can see that, even though both files report a logical size of 500MiB, the allocated file occupies the same space physically while the sparse file occupies no space. In the remaining sections I will discuss what sparse files are, what their usecases are and some of the dangers associated with them.
 
 ### Sparse files, usecases & downsides
@@ -68,22 +73,57 @@ Comparison of thin provisioning to the traditional approach of thick provisionin
 
 Partitioning is the process of subdividing a large disk into smaller blocks. Just like any other block device, loop devices can also be partitioned. In this experiment I create a 1GB image and attach it to /dev/loop0. Using the `parted`(partition editor) tool I create a GPT style partition table on the disk. There are generally 2 types of partition tables, the traditional Master Boot Record (MBR) and the newer Globally Unique Identifier Partition Table (GPT). GPT keeps two partition tables, the primary GPT header stored at the very start of the disk and the secondary backup GPT header table stored at the end of the disk.<br>
 I make 2 ext4 primary partitions on the disk then unmount the loop device and attach it again with -P option to reload the partition table. `lsblk` now shows two partitions under the loop device. The rest of the steps involve making ext4 filesystems on the partitions, mounting them and showing writes can be done on both partitions.
+
 ![](/loop-devices/labs/assets/03-partitioning/inspect_disk.png)
+
 The GPT partition tables created can be viewed using the command `fdisk -l /dev/loop0`. THe output shows the partition style, the GUID and the partitions.
 
 ## 4. Resizing a loop device and its filesystem
 
 ![](/loop-devices/labs/assets/04-resizing/resizing_dev_and_fs.png)
+
 Since loop devices are backed by files, resizing the block device by expanding or shrinking the file is easy. Expanding the file and loop device size is can be done while the filesystem is mounted. First I increase the size using truncate, at this point even though the backing file size is increased, the loop device and filesystem still report the old size. I force the loop driver to reread the device's capacity using the `-c` option and the filesystem to reread the new changes using `resizefs`.
 
 ![](/loop-devices/labs/assets/04-resizing/shrink_disk_and_fs.png)
+
 Shrinking the size of the loop device and filesystem is abit trickier. For this the fileystem must first be unmounted and the steps followed in a specific order. First I shrink the size of the file down then force the loop driver to reread the new device size. Next I run `e2fsck` which checks the filesystem status, running it with `-f` option forces checking even if the filesystem may be corrupted. Since the original image already had a filesystem before it was shrunk, e2fsck rightly reports the filesystem may be corrupted. We proceed despite the warning and all the 5 checks pass. Next we force the filesystem to record the new size. We can then mount and use the device again.
 
 ## 5. Read-only mode
 
 ![](/loop-devices/labs/assets/05-read_only_mode/read_only_mounts.png)
+
 Read-only mode does not allow writing. It can be configured at two levels, when mounting the filesystem inside the loop device or when attaching the loop device to the file. I attach the loop device in read-only mode using the `--read-only` option of losetup. Then I mount the ext4 filesystem in read-noly mode using `ro,noload`; ro means read-only and noload means the ext4 journal should not be replayed on the filesystem, replaying the journal would have attempted writing on the filesytem as it is mounted. After this `blockdev --getro` reports the filesystem is read-only and any attempt to write to it fails with an error.<br>
 I experiment with a loop device that allows read/write and a filesystem that supports read-only, the filesystem setting is respected and it blocks any writes. Another experiment is with a filesystem that supports read/write but a loop device that supports read-only and the loop device configuration is respected, blocking any writes.
 
 ## 6. Filesystem corruption and repair
 
+In this section I corrupt the loop device filesystem then demonstrate how to repair it. As you'll see later, repairing a corrupt filesystem can be easy as long as you know where to find backup superblocks, easier said than done in some cases.
+
+![](/loop-devices/labs/assets/06-corruption_and_repair/create_fs.png)
+
+The usual steps are to create the backing file, attach the loop device, create filesystem on it and mount. I write data to the loop device, after restoring this is what we will check to see the data has been recovered. Next I unmount and detach the filesystem then run `e2fsck -fn`. The command check the filesystem and does not do apply any fixes to errors it encounters, it just prints the findings. Since the filesystem is healthy, nothing out of ordinary is printed. Finally I make a copy of the backing image before corrupting it.<br>
+The filesystem superblock are stored at the starting sectors of the disk. I can introduce data corruption by overwriting the primary superblock metadata with random bytes. The filesystem cannot be loaded or accessed if the primary superblock is corrupted. I use the following command to overwrite the primary superblock with random bytes:
+
+```bash
+sudo dd if=/dev/urandom of=corrupt.img bs=1024 count=1 seek=1 status=none conv=notrunc
+```
+
+This command copies random bytes from /dev/urandom to our backing file. I use block size 0f 1024 bytes and only copy one block to the starting sector of the image.
+
+![](/loop-devices/labs/assets/06-corruption_and_repair/check_corrupt_fs.png)
+
+I run the same e2fsck command as before to check the health of the filesystem and this time it detects the corruption and prints it. The `-n` option instructs e2fsck to not fix any issues.
+
+![](/loop-devices/labs/assets/06-corruption_and_repair/find_backup_and_restore.png)
+
+The final step is attempting to repair it, and for this I need the backup superblocks. The `dumpe2fs` tool dumps all filesystem information and metadata, including the clock numbers of the primary and backup superblocks. From the output you can pick any backup superblock and use it in the repair by passing it to e2fsck using the -b option. When done, running on the repaired `e2fsck -fn <file>` should show the 5 checks passed. I mounted the same filesystem and printed the data I wrote at the start and it is still present.
+
+## 7. Buffered vs Direct I/O
+
+This experiment shows the two I/O patterns used with block devices and how they affect the I/O bandwidth. Buffered I/O means the kernel accepts write requests and saves them in the page cache in memory and flushes them to disk later. Direct I/O means the kernel bypasses the page cache and writes every request to disk before reporting it as successful.
+
+![](/loop-devices/labs/assets/07-buffered_vs_direct_io/buffered_vs_direct_io.png)
+
+After the loop device is mounted I check the I/O pattern is use through sysfs: `cat sys/block/loop0/loop/dio`. It reports 0 if the I/O mode is buffered, 1 otherwise. I am starting with the buffered mode. I use `dd` to write random bytes from /dev/urandom to a file inside the mounted filesystem in the loop device, writing 200MB of data. The reported bandwidth is 368MB/s for buffered I/O. After using buffered I/O you can trigger flushing from page cache to disk using the `sync` call.<br>
+I did the same experiment using direct I/O. First I attach the loop device with direct I/O enabled and confirm it through sysfs. Next I run the same dd command above, copying 200MB from /dev/urandom to a file inside the filesystem. THe reported bandwidth is significantly lower, 233MB/s.<br>
+Buffered I/O is faster because as soon as the data is written in the page cache in memory, the kernel reports it as successful, the data is later flushed at once to the disk either at periodic intervals or when `sync/fsync` is called. In contrast, direct I/O incurs the full cost of disk I/O for every write request.
