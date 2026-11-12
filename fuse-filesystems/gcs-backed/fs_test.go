@@ -410,9 +410,71 @@ func TestCreateEmptyFile(t *testing.T) {
 			t.Fatalf("empty object: exists=%v content=%q", ok, got)
 		}
 
-		rc, _ := e.fs.Create("/empty", fuse.O_WRONLY, 0o644)
-		check(t, "Create(existing)", rc, -fuse.EEXIST)
+		rc, _ := e.fs.Create("/empty", fuse.O_WRONLY|fuse.O_EXCL, 0o644)
+		check(t, "Create(existing, O_EXCL)", rc, -fuse.EEXIST)
 	})
+}
+
+// EXP-002: the kernel sends CREATE when its lookup said "missing", which can
+// be out of date. On an existing name, Create must act like open(2) with
+// O_CREAT.
+func TestCreateExistingName(t *testing.T) {
+	forEachEnv(t, func(t *testing.T, e *testEnv) {
+		e.put(t, "f", "theirs", nil)
+
+		rc, fh := e.fs.Create("/f", fuse.O_RDWR, 0o600)
+		check(t, "Create(existing)", rc, 0)
+
+		if got := e.readHandle(t, "/f", fh); got != "theirs" {
+			t.Fatalf("Create without O_TRUNC reads %q, want the existing data", got)
+		}
+
+		e.fs.Release("/f", fh)
+
+		rc, fh = e.fs.Create("/f", fuse.O_WRONLY|fuse.O_TRUNC, 0o600)
+		check(t, "Create(existing, O_TRUNC)", rc, 0)
+		check(t, "Write", e.fs.Write("/f", []byte("mine"), 0, fh), 4)
+		check(t, "Flush", e.fs.Flush("/f", fh), 0)
+		e.fs.Release("/f", fh)
+
+		if got, _ := e.remote(t, "f"); got != "mine" {
+			t.Fatalf("remote = %q, want the truncated and rewritten file", got)
+		}
+
+		// The mode argument applies only to a file that is actually created.
+		if perm := e.stat(t, "/f").Mode & 0o7777; perm != 0o644 {
+			t.Fatalf("mode = %o, want the existing file's 644", perm)
+		}
+
+		check(t, "Mkdir", e.fs.Mkdir("/d", 0o755), 0)
+		rc, _ = e.fs.Create("/d", fuse.O_WRONLY, 0o644)
+		check(t, "Create(directory)", rc, -fuse.EISDIR)
+	})
+}
+
+// EXP-002, as a user sees it: a cached miss is still being served after
+// another client created the file, and `echo > f` must work anyway.
+func TestCreateAfterStaleCachedMiss(t *testing.T) {
+	e := newEnv(t, newMemBucket(), func(c *Config) { c.StatTTL = time.Minute })
+
+	var st fuse.Stat_t
+	check(t, "Getattr", e.fs.Getattr("/f", &st, noFH), -fuse.ENOENT)
+
+	e.put(t, "f", "theirs", nil)
+	check(t, "Getattr (cached miss)", e.fs.Getattr("/f", &st, noFH), -fuse.ENOENT)
+
+	rc, fh := e.fs.Create("/f", fuse.O_WRONLY|fuse.O_TRUNC, 0o644)
+	check(t, "Create", rc, 0)
+	check(t, "Write", e.fs.Write("/f", []byte("mine"), 0, fh), 4)
+	check(t, "Flush", e.fs.Flush("/f", fh), 0)
+	e.fs.Release("/f", fh)
+
+	if got, _ := e.remote(t, "f"); got != "mine" {
+		t.Fatalf("remote = %q, want %q", got, "mine")
+	}
+
+	rc, _ = e.fs.Create("/f", fuse.O_WRONLY|fuse.O_EXCL, 0o644)
+	check(t, "Create(O_EXCL)", rc, -fuse.EEXIST)
 }
 
 // T-202: shrink then grow returns zeros (bug B1 regression).
@@ -1020,6 +1082,36 @@ func TestCacheExpiry(t *testing.T) {
 	}
 }
 
+// EXP-001: expired entries go away once the cache grows, even when their
+// names are never looked up again (as after a big `ls -R`).
+func TestCacheSweepsExpiredEntries(t *testing.T) {
+	now := time.Now()
+	c := newStatCache(time.Second, func() time.Time { return now })
+
+	for i := range 2 * minSweep {
+		c.putIfUnchanged(fmt.Sprintf("old/%d", i), entry{exists: true}, c.snapshot())
+	}
+
+	now = now.Add(time.Minute)
+
+	for i := range 2 * minSweep {
+		c.putIfUnchanged(fmt.Sprintf("new/%d", i), entry{exists: true}, c.snapshot())
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for k := range c.m {
+		if strings.HasPrefix(k, "old/") {
+			t.Fatalf("expired entry %q still cached (%d entries)", k, len(c.m))
+		}
+	}
+
+	if len(c.m) != 2*minSweep {
+		t.Fatalf("%d entries cached, want the %d live ones", len(c.m), 2*minSweep)
+	}
+}
+
 // T-403: ls -l pattern; readdir fills the cache so per-file lookups are free.
 // Subdirectories still cost one lookup (a stat plus a one-entry list): a
 // listing can't reveal a placeholder's stored mode (review finding #5).
@@ -1377,4 +1469,45 @@ func TestConcurrentReadsOnOneHandle(t *testing.T) {
 			t.Fatal("content mismatch under concurrent reads")
 		}
 	})
+}
+
+// deleteAfterCopy stands in for another client that deletes a rename's source
+// right after the server-side copy.
+type deleteAfterCopy struct{ *memBucket }
+
+func (d deleteAfterCopy) Copy(ctx context.Context, src string, srcGen int64, dst string, dstCond int64) (ObjAttrs, error) {
+	a, err := d.memBucket.Copy(ctx, src, srcGen, dst, dstCond)
+	if err == nil {
+		_ = d.memBucket.Delete(ctx, src, condNone)
+	}
+
+	return a, err
+}
+
+// EXP-003: if the source is already gone when rename deletes it, the rename
+// has happened. Report success and repoint open handles.
+func TestRenameSourceDeletedAfterCopy(t *testing.T) {
+	e := newEnv(t, deleteAfterCopy{newMemBucket()})
+	e.put(t, "a", "data", nil)
+
+	fh := e.open(t, "/a", fuse.O_RDONLY)
+	check(t, "Rename", e.fs.Rename("/a", "/b"), 0)
+
+	if e.exists(t, "a") {
+		t.Fatal("source still exists")
+	}
+
+	if got, _ := e.remote(t, "b"); got != "data" {
+		t.Fatalf("destination = %q, want %q", got, "data")
+	}
+
+	if h := e.fs.handle(fh); h.name != "b" {
+		t.Fatalf("open handle still points at %q", h.name)
+	}
+
+	if got := e.readHandle(t, "/b", fh); got != "data" {
+		t.Fatalf("read through the moved handle = %q", got)
+	}
+
+	e.fs.Release("/b", fh)
 }

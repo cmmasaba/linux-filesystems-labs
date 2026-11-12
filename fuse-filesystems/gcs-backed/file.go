@@ -135,7 +135,7 @@ func (fs *FileSystem) ensureLoaded(f *openFile) error {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), fs.cfg.IOTimeout)
-	defer cancel()
+	defer cancel()	
 
 	r, err := fs.b.NewReader(ctx, f.name, f.gen, 0, -1)
 	if err != nil {

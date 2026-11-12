@@ -94,8 +94,6 @@ func (fs *FileSystem) errno(op, name string, err error) int {
 	}
 }
 
-// ---- lookup ----
-
 // lookup resolves a name with two concurrent requests: a stat of the object
 // itself and a one-entry listing under name+"/". A directory wins over a file
 // of the same name.
@@ -144,7 +142,8 @@ func (fs *FileSystem) lookup(name string) (entry, error) {
 
 	switch {
 	case len(lst.Objects) > 0 && lst.Objects[0].Name == dirPrefix(name):
-		e = entry{exists: true, isDir: true, attrs: &lst.Objects[0]}
+		placeholder := lst.Objects[0]
+		e = entry{exists: true, isDir: true, attrs: &placeholder}
 	case fs.cfg.ImplicitDirs && len(lst.Objects)+len(lst.Prefixes) > 0:
 		e = entry{exists: true, isDir: true}
 	case fileErr == nil:
@@ -203,8 +202,6 @@ func (fs *FileSystem) localOverride(name string) (fuse.Stat_t, bool) {
 
 	return fuse.Stat_t{}, false
 }
-
-// ---- attributes ----
 
 func (fs *FileSystem) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 	name := objectName(path)
@@ -348,8 +345,6 @@ func (fs *FileSystem) Chown(_ string, uid, gid uint32) int {
 	return -fuse.EPERM
 }
 
-// ---- directories ----
-
 func (fs *FileSystem) Opendir(path string) (int, uint64) {
 	name := objectName(path)
 
@@ -449,7 +444,11 @@ func (fs *FileSystem) Readdir(path string, fill func(string, *fuse.Stat_t, int64
 
 		st := fs.fileStat(o)
 		entries[child] = dirent{&st, false}
-		fs.cache.putIfUnchanged(o.Name, entry{exists: true, attrs: o}, epoch)
+
+		// Cache a copy: a pointer into lst.Objects would keep the whole
+		// listing alive for as long as any one entry stays cached.
+		attrs := *o
+		fs.cache.putIfUnchanged(o.Name, entry{exists: true, attrs: &attrs}, epoch)
 	}
 
 	// Merge open files whose local state isn't in GCS yet.
@@ -601,8 +600,6 @@ func (fs *FileSystem) Rmdir(path string) int {
 	return fs.errno("rmdir", name, err)
 }
 
-// ---- files ----
-
 func (fs *FileSystem) addHandle(h *handle) uint64 {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -625,6 +622,11 @@ func (fs *FileSystem) newHandle(f *openFile, flags int) *handle {
 
 // Create makes a new, empty file. Nothing is written to GCS until the first
 // flush (decision D3); until then the file exists only in this process.
+//
+// The kernel sends CREATE only after its lookup said the name was missing,
+// but the name can exist anyway: a cached miss is up to --stat-ttl old, and
+// another client may have created the file since. Create then behaves like
+// open(2) with O_CREAT: O_EXCL fails, anything else opens the existing file.
 func (fs *FileSystem) Create(path string, flags int, mode uint32) (int, uint64) {
 	if fs.cfg.ReadOnly {
 		return -fuse.EROFS, noFH
@@ -638,17 +640,26 @@ func (fs *FileSystem) Create(path string, flags int, mode uint32) (int, uint64) 
 	fs.nsMu.Lock()
 	defer fs.nsMu.Unlock()
 
-	if fs.openFileFor(name) != nil {
-		return -fuse.EEXIST, noFH
+	exists, isDir := fs.openFileFor(name) != nil, false
+
+	if !exists {
+		e, err := fs.freshLookup(name)
+		if err != nil {
+			return fs.errno("create", name, err), noFH
+		}
+
+		exists, isDir = e.exists, e.isDir
 	}
 
-	e, err := fs.freshLookup(name)
-	if err != nil {
-		return fs.errno("create", name, err), noFH
-	}
+	if exists {
+		switch {
+		case flags&fuse.O_EXCL != 0:
+			return -fuse.EEXIST, noFH
+		case isDir:
+			return -fuse.EISDIR, noFH
+		}
 
-	if e.exists {
-		return -fuse.EEXIST, noFH
+		return fs.openExisting(name, flags)
 	}
 
 	now := fs.now()
@@ -716,7 +727,12 @@ func (fs *FileSystem) Mknod(path string, mode uint32, _ uint64) int {
 // Open stats the object on every open (close-to-open consistency) and pins
 // the handle's remote reads to that generation.
 func (fs *FileSystem) Open(path string, flags int) (int, uint64) {
-	name := objectName(path)
+	return fs.openExisting(objectName(path), flags)
+}
+
+// openExisting opens a file that already exists, locally or in GCS. Open uses
+// it, and so does Create when the name turns out to exist.
+func (fs *FileSystem) openExisting(name string, flags int) (int, uint64) {
 	writable := flags&fuse.O_ACCMODE != fuse.O_RDONLY
 
 	if writable && fs.cfg.ReadOnly {
@@ -1064,8 +1080,6 @@ func (fs *FileSystem) Unlink(path string) int {
 	return 0
 }
 
-// ---- rename ----
-
 func (fs *FileSystem) Rename(oldpath, newpath string) int {
 	if fs.cfg.ReadOnly {
 		return -fuse.EROFS
@@ -1166,7 +1180,9 @@ func (fs *FileSystem) renameFile(oldN, newN string, src, dst entry, f *openFile)
 	// The copy exists from here on, even if the delete below fails.
 	fs.cache.invalidate(oldN, newN)
 
-	if err := fs.b.Delete(ctx, oldN, srcGen); err != nil {
+	// Not found means another client deleted the source after the copy. The
+	// result is the same as a completed rename, so finish it.
+	if err := fs.b.Delete(ctx, oldN, srcGen); err != nil && !errors.Is(err, errNotFound) {
 		slog.Error("rename copied the file but could not delete the source; both now exist",
 			"from", oldN, "to", newN, "err", err)
 

@@ -50,8 +50,8 @@ func metaMtimeOr(meta map[string]string, fallback time.Time) time.Time {
 	return time.Unix(0, v)
 }
 
-// makeStat builds a Stat_t. Ino stays 0: without SetUseIno, libfuse assigns
-// inode numbers itself. atime is not tracked and mirrors mtime.
+// makeStat builds a Stat_t.
+// Ino stays 0: without SetUseIno, libfuse assigns inode numbers itself.
 func (fs *FileSystem) makeStat(mode uint32, size int64, mtime, ctime, birth time.Time) fuse.Stat_t {
 	return fuse.Stat_t{
 		Mode:     mode,

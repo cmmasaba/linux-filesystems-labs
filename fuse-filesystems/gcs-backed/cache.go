@@ -27,16 +27,25 @@ type cachedEntry struct {
 // Results are stored with putIfUnchanged: a lookup that started before a
 // local change and finished after it must not re-insert what it saw, so every
 // invalidation bumps an epoch and stale results are dropped.
+//
+// get removes an expired entry only when its name is asked for again, so
+// putIfUnchanged also sweeps every expired entry whenever the map reaches
+// sweepAt. Otherwise a walk over a large bucket would keep every name it saw
+// until unmount.
 type statCache struct {
-	mu    sync.Mutex
-	ttl   time.Duration
-	now   func() time.Time
-	m     map[string]cachedEntry
-	epoch uint64
+	mu      sync.Mutex
+	ttl     time.Duration
+	now     func() time.Time
+	m       map[string]cachedEntry
+	epoch   uint64
+	sweepAt int
 }
 
+// minSweep is the smallest map size that triggers a sweep.
+const minSweep = 1024
+
 func newStatCache(ttl time.Duration, now func() time.Time) *statCache {
-	return &statCache{ttl: ttl, now: now, m: map[string]cachedEntry{}}
+	return &statCache{ttl: ttl, now: now, m: map[string]cachedEntry{}, sweepAt: minSweep}
 }
 
 func (c *statCache) get(name string) (entry, bool) {
@@ -82,7 +91,26 @@ func (c *statCache) putIfUnchanged(name string, e entry, epoch uint64) {
 		return
 	}
 
-	c.m[name] = cachedEntry{e: e, expires: c.now().Add(c.ttl)}
+	now := c.now()
+	c.m[name] = cachedEntry{e: e, expires: now.Add(c.ttl)}
+
+	if len(c.m) >= c.sweepAt {
+		c.sweepLocked(now)
+	}
+}
+
+// sweepLocked drops every expired entry. The next sweep waits until the map
+// has doubled from what is left, so the cost of a sweep is spread over the
+// inserts in between, and the map never grows past twice what the previous
+// sweep left (or minSweep). c.mu must be held.
+func (c *statCache) sweepLocked(now time.Time) {
+	for k, ce := range c.m {
+		if now.After(ce.expires) {
+			delete(c.m, k)
+		}
+	}
+
+	c.sweepAt = max(minSweep, 2*len(c.m))
 }
 
 // invalidate drops the given names and their parent directories. A parent can

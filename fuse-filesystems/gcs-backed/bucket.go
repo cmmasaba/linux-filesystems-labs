@@ -20,8 +20,7 @@ type ObjAttrs struct {
 }
 
 // ListResult holds one directory-style listing. With a delimiter, Prefixes are
-// the "subdirectories" (each ends in the delimiter) and Objects are the direct
-// children, including a placeholder object equal to the listing prefix.
+// the subdirectories ending in the delimiter and Objects are the direct children.
 type ListResult struct {
 	Objects  []ObjAttrs
 	Prefixes []string
@@ -41,8 +40,7 @@ var (
 )
 
 // Bucket is the narrow view of GCS the filesystem needs. gcsBucket implements
-// it with cloud.google.com/go/storage. Keeping it small keeps GCS details in
-// one file and lets countingBucket measure how many calls an operation costs.
+// it with cloud.google.com/go/storage.
 type Bucket interface {
 	Stat(ctx context.Context, name string) (ObjAttrs, error)
 	// List returns objects under prefix. With delim "/" it collapses deeper
@@ -56,8 +54,7 @@ type Bucket interface {
 	// Copy copies generation srcGen (0 = latest) of src to dst, keeping metadata.
 	Copy(ctx context.Context, src string, srcGen int64, dst string, dstCond int64) (ObjAttrs, error)
 	Delete(ctx context.Context, name string, cond int64) error
-	// UpdateMetadata merges meta into the object's custom metadata without
-	// touching its data. The generation does not change.
+	// UpdateMetadata merges meta into the object's custom metadata without touching its data.
 	UpdateMetadata(ctx context.Context, name string, meta map[string]string) (ObjAttrs, error)
 }
 
